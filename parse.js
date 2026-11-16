@@ -151,33 +151,54 @@ const ALNUM_TEST = /[\p{L}\p{N}]/u;
 // positions align with src positions.
 function maskInline(src, defs) {
   if (src.indexOf('*') < 0 && src.indexOf('_') < 0 && src.indexOf('~') < 0) return src;
+  // Fast path: with no link/code/html/escape construct present, the mask is
+  // the identity — skip the two passes entirely.
+  if (src.indexOf('[') < 0 && src.indexOf('`') < 0 && src.indexOf('<') < 0 && src.indexOf('\\') < 0) return src;
   const n = src.length;
   // Phase A (marked's anyPunctuationOutsideCode): escapes become '+', and
   // the inner backticks of a code span become '+' so the span is clean for
-  // the link pattern in phase B. Length-preserving.
-  const plus = src.split('');
+  // the link pattern in phase B. Collect replacement positions; if there
+  // are none, the phase-B input is src itself (no allocation).
+  let plusPos = null;
   {
     let i = 0;
     while (i < n) {
       const c = src[i];
       if (c === '\\' && i + 1 < n && ASCII_PUNCT.has(src[i + 1])) {
-        plus[i] = '+'; plus[i + 1] = '+'; i += 2; continue;
+        if (!plusPos) plusPos = [];
+        plusPos.push(i, i + 1);
+        i += 2; continue;
       }
       if (c === '`') {
         let m = 1;
         while (src[i + m] === '`') m++;
         const close = findCodeClose(src, i + m, m);
         if (close < 0 || close === i + m) { i += m; continue; }
-        for (let k = i + m; k < close; k++) if (plus[k] === '`') plus[k] = '+';
+        for (let k = i + m; k < close; k++) if (src[k] === '`') {
+          if (!plusPos) plusPos = [];
+          plusPos.push(k);
+        }
         i = close + m;
         continue;
       }
       i += 1;
     }
   }
-  const ptxt = plus.join('');
+  let ptxt = src;
+  if (plusPos) {
+    const parts = [];
+    let last = 0;
+    for (const p of plusPos) {
+      if (p > last) parts.push(src.slice(last, p));
+      parts.push('+');
+      last = p + 1;
+    }
+    if (last < n) parts.push(src.slice(last));
+    ptxt = parts.join('');
+  }
   // Phase B (marked's blockSkip): mask links, code spans, html spans.
-  const out = plus.slice();
+  // Collect spans and build the result from slices.
+  let spans = null;
   let i = 0;
   while (i < n) {
     const c = ptxt[i];
@@ -187,9 +208,8 @@ function maskInline(src, defs) {
       const close = findCodeClose(ptxt, i + m, m);
       if (close < 0 || close === i + m) { i += m; continue; }
       const end = close + m;
-      out[i] = '[';
-      for (let k = i + 1; k < end - 1; k++) out[k] = 'a';
-      out[end - 1] = ']';
+      if (!spans) spans = [];
+      spans.push(i, end);
       i = end;
       continue;
     }
@@ -197,12 +217,9 @@ function maskInline(src, defs) {
       const isImage = c === '!';
       const link = tryLink(ptxt, isImage ? i + 1 : i, defs, isImage, true);
       if (link) {
-        const start = i;
-        const end = link.end;
-        out[start] = '[';
-        for (let k = start + 1; k < end - 1; k++) out[k] = 'a';
-        if (end - 1 > start) out[end - 1] = ']';
-        i = end;
+        if (!spans) spans = [];
+        spans.push(i, link.end);
+        i = link.end;
         continue;
       }
       i += 1;
@@ -211,9 +228,8 @@ function maskInline(src, defs) {
     if (c === '<') {
       const tl = htmlTagLen(ptxt, i);
       if (tl > 0) {
-        out[i] = '[';
-        for (let k = i + 1; k < i + tl - 1; k++) out[k] = 'a';
-        out[i + tl - 1] = ']';
+        if (!spans) spans = [];
+        spans.push(i, i + tl);
         i += tl;
         continue;
       }
@@ -223,9 +239,8 @@ function maskInline(src, defs) {
         let j = i + 1;
         while (j < n && ptxt[j] !== '>' && ptxt[j] !== '<') j++;
         if (ptxt[j] === '>') {
-          out[i] = '[';
-          for (let k = i + 1; k < j; k++) out[k] = 'a';
-          out[j] = ']';
+          if (!spans) spans = [];
+          spans.push(i, j + 1);
           i = j + 1;
           continue;
         }
@@ -235,6 +250,16 @@ function maskInline(src, defs) {
     }
     i += 1;
   }
+  if (!spans) return ptxt;
+  const out = [];
+  let last = 0;
+  for (let s = 0; s < spans.length; s += 2) {
+    const a = spans[s], b = spans[s + 1];
+    if (a > last) out.push(ptxt.slice(last, a));
+    out.push('[' + 'a'.repeat(Math.max(0, b - a - 2)) + ']');
+    last = b;
+  }
+  if (last < n) out.push(ptxt.slice(last));
   return out.join('');
 }
 
