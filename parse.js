@@ -367,6 +367,11 @@ function inlineParse(src, defs, inLink, alt) {
   const pushHtml = (h) => { flushText(); if (h) parts.push(h); };
   const n = src.length;
   let i = 0;
+  // Fast path: a string with no inline construct and no autolink candidate
+  // is just escaped text (covers most table cells, headings, short lines).
+  if (!inLink && !alt && src.indexOf('\\') < 0 && src.indexOf('`') < 0 && src.indexOf('*') < 0 && src.indexOf('_') < 0 && src.indexOf('~') < 0 && src.indexOf('[') < 0 && src.indexOf('!') < 0 && src.indexOf('<') < 0 && src.indexOf('\n') < 0 && src.indexOf(':') < 0 && src.indexOf('@') < 0 && src.indexOf('www.') < 0) {
+    return escText(src);
+  }
   // Masked source for emStrong/del closer search (links, code, HTML hidden).
   const masked = maskInline(src, defs);
 
@@ -2090,7 +2095,7 @@ function renderBlocks(blocks, defs) {
 // ---------------- entry point ----------------
 
 function parse(src) {
-  src = src.replace(/\r\n?/g, '\n');
+  if (src.indexOf('\r') >= 0) src = src.replace(/\r\n?/g, '\n');
   let lines = src.split('\n');
   const srcEndsWithNL = src.endsWith('\n');
   if (srcEndsWithNL) lines.pop();
