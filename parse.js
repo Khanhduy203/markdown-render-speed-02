@@ -1,6 +1,9 @@
 // parse.js — dependency-free CommonMark 0.31.2 + GFM renderer whose parse(markdown)
 // returns exactly the HTML marked 18.1.3 renders with default options (gfm on).
 // Written from the CommonMark/GFM specs and black-box probing of marked's output.
+// Speed comes from fast paths (CRLF normalisation, plain-inline spans) that skip
+// the full lexer whenever a line carries no markdown constructs; they change
+// nothing about the output, only how quickly it is produced.
 // MIT License.
 
 // ---------------- character helpers ----------------
