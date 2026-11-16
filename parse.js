@@ -1248,6 +1248,11 @@ class Blocks {
     const info = line.slice(idx + m).replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
     if (ch === '`' && info.indexOf('`') >= 0) return false;
     const lang = info ? unescape(info.split(/[ \t]/, 1)[0]) : null;
+    // Marked's indentCodeCompensation strips up to N leading whitespace
+    // CHARS (not columns) from each content line, where N is the fence
+    // line's leading-whitespace length — and only for backtick fences
+    // (the regex is /^(\s+)(?:```)/, so tilde fences get no compensation).
+    const stripN = ch === '`' ? idx : 0;
     const content = [];
     let j = this.i + 1;
     while (j < this.lines.length) {
@@ -1258,7 +1263,13 @@ class Blocks {
         while (l[ci + m2] === ch) m2++;
         if (m2 >= m && /^[ \t]*$/.test(l.slice(ci + m2))) { j++; break; }
       }
-      content.push(stripCols(l, col));
+      if (stripN > 0) {
+        let w = 0;
+        while (w < l.length && (l[w] === ' ' || l[w] === '\t')) w++;
+        content.push(l.slice(Math.min(w, stripN)));
+      } else {
+        content.push(l);
+      }
       j++;
     }
     // No trailing newline is added when the last content line is blank.
@@ -1415,9 +1426,11 @@ class Blocks {
         break;
       }
       const [c2] = indentInfo(l);
-      // When a fence is open inside the item, lines belong to the item as
-      // fence content regardless of indent (until the fence closes).
-      if (ps.fence) {
+      // When a fence with content is open inside the item, lines belong to
+      // the item as fence content regardless of indent (until the fence
+      // closes). A fence with no content yet does NOT capture: an
+      // under-indented line ends the item and leaves the fence empty.
+      if (ps.fence && ps.fenceHasContent) {
         const stripped = stripColsExpand(l, ci);
         content.push(stripped);
         quoteParaState(stripped, ps);
@@ -1517,7 +1530,11 @@ class Blocks {
     // whenever one follows in the source; types 6-7 end at a blank line and
     // keep a trailing newline only at end of input.
     if (type <= 5) {
-      if ((endIdx < L.length - 1 && !isBlank(L[endIdx + 1])) || (endIdx === L.length - 1 && this.srcEndsWithNL)) text += '\n';
+      // Marked's html regex captures the newline(s) after the end-sequence
+      // line; trimTrailingBlankLines drops them only when 2+ were captured,
+      // i.e. when the next line is EMPTY (a whitespace-only next line keeps
+      // the single newline).
+      if ((endIdx < L.length - 1 && L[endIdx + 1].length > 0) || (endIdx === L.length - 1 && this.srcEndsWithNL)) text += '\n';
     } else if (endIdx === L.length - 1 && this.srcEndsWithNL) {
       text += '\n';
     }
@@ -1592,13 +1609,16 @@ function quoteParaState(line, st) {
     if (col <= 3 && line[idx] === st.fence.ch) {
       let m = 0;
       while (line[idx + m] === st.fence.ch) m++;
-      if (m >= st.fence.len && /^[ \t]*$/.test(line.slice(idx + m))) st.fence = null;
+      if (m >= st.fence.len && /^[ \t]*$/.test(line.slice(idx + m))) { st.fence = null; st.fenceHasContent = false; }
+      else st.fenceHasContent = true;
+    } else {
+      st.fenceHasContent = true;
     }
     st.inPara = false;
     return;
   }
   const fi = fenceInfo(line);
-  if (fi) { st.fence = fi; st.inPara = false; return; }
+  if (fi) { st.fence = fi; st.fenceHasContent = false; st.inPara = false; return; }
   if (isBlank(s)) { st.inPara = false; return; }
   const [col, idx] = indentInfo(s);
   if (col > 3) return; // keep prev inPara
