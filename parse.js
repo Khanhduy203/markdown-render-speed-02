@@ -94,13 +94,215 @@ function normLabel(s) {
 // Node list: [0, html] text/already-rendered, [1, ch, len, canOpen, canClose] delimiter,
 // [2, kind, children] em(1)/strong(2) wrapper (children rendered at the end).
 
+// ---------------- marked-compatible emphasis / strikethrough ----------------
+// Marked's emStrong/del are regex-driven: at an opener, scan forward for a
+// closer over a MASKED source (links, code spans, HTML and escapes replaced
+// by same-length filler so their delimiters are invisible), applying the
+// CommonMark rule-of-3 for emphasis and exact-length matching for del. The
+// content is then parsed recursively. This replaces a delimiter stack, which
+// disagrees with marked on partial-length matches (e.g. **a*b** stays strong).
+
+const _P = '[\\p{P}\\p{S}]';
+const _PS = '[\\s\\p{P}\\p{S}]';
+const _NP = '[^\\s\\p{P}\\p{S}]';
+// GFM variants: ~ is not punctuation for strong/em purposes.
+const _PG = '(?!~)[\\p{P}\\p{S}]';
+const _PSG = '(?!~)[\\s\\p{P}\\p{S}]';
+const _NPG = '(?:[^\\s\\p{P}\\p{S}]|~)';
+
+function buildDelimRe(core, flags, np, ps, p) {
+  const s = core.split('notPunctSpace').join(np).split('punctSpace').join(ps).split('punct').join(p);
+  return new RegExp(s, flags);
+}
+
+const EM_STRONG_L = buildDelimRe('^(?:\\*+(?:((?!\\*)punct)|([^\\s*]))?)|^_+(?:((?!_)punct)|([^\\s_]))?', 'u', _NPG, _PSG, _PG);
+const EM_STRONG_R_AST = buildDelimRe(
+  '^[^_*]*?__[^_*]*?\\*[^_*]*?(?=__)'
+  + '|[^*]+(?=[^*])'
+  + '|(?!\\*)punct(\\*+)(?=[\\s]|$)'
+  + '|notPunctSpace(\\*+)(?!\\*)(?=punctSpace|$)'
+  + '|(?!\\*)punctSpace(\\*+)(?=notPunctSpace)'
+  + '|[\\s](\\*+)(?!\\*)(?=punct)'
+  + '|(?!\\*)punct(\\*+)(?!\\*)(?=punct)'
+  + '|notPunctSpace(\\*+)(?=notPunctSpace)', 'gu', _NPG, _PSG, _PG);
+const EM_STRONG_R_UND = buildDelimRe(
+  '^[^_*]*?\\*\\*[^_*]*?_[^_*]*?(?=\\*\\*)'
+  + '|[^_]+(?=[^_])'
+  + '|(?!_)punct(_+)(?=[\\s]|$)'
+  + '|notPunctSpace(_+)(?!_)(?=punctSpace|$)'
+  + '|(?!_)punctSpace(_+)(?=notPunctSpace)'
+  + '|[\\s](_+)(?!_)(?=punct)'
+  + '|(?!_)punct(_+)(?!_)(?=punct)', 'gu', _NP, _PS, _P);
+const DEL_L = buildDelimRe('^~~?(?:((?!~)punct)|[^\\s~])', 'u', _NP, _PS, _P);
+const DEL_R = buildDelimRe(
+  '^[^~]+(?=[^~])'
+  + '|(?!~)punct(~~?)(?=[\\s]|$)'
+  + '|notPunctSpace(~~?)(?!~)(?=punctSpace|$)'
+  + '|(?!~)punctSpace(~~?)(?=notPunctSpace)'
+  + '|[\\s](~~?)(?!~)(?=punct)'
+  + '|(?!~)punct(~~?)(?!~)(?=punct)'
+  + '|notPunctSpace(~~?)(?=notPunctSpace)', 'gu', _NP, _PS, _P);
+
+const PUNCT_TEST = /^((?![*_])[\s\p{P}\p{S}])/u;
+const ALNUM_TEST = /[\p{L}\p{N}]/u;
+
+// Mask links, code spans, HTML tags and escapes with same-length filler so
+// emStrong/del do not see delimiters inside them. Length-preserving: masked
+// positions align with src positions.
+function maskInline(src, defs) {
+  if (src.indexOf('*') < 0 && src.indexOf('_') < 0 && src.indexOf('~') < 0) return src;
+  const n = src.length;
+  const out = src.split('');
+  let i = 0;
+  while (i < n) {
+    const c = src[i];
+    if (c === '\\' && i + 1 < n && ASCII_PUNCT.has(src[i + 1])) {
+      out[i] = '+'; out[i + 1] = '+'; i += 2; continue;
+    }
+    if (c === '`') {
+      let m = 1;
+      while (src[i + m] === '`') m++;
+      const close = findCodeClose(src, i + m, m);
+      if (close < 0) { i += m; continue; }
+      const end = close + m;
+      out[i] = '[';
+      for (let k = i + 1; k < end - 1; k++) out[k] = 'a';
+      out[end - 1] = ']';
+      i = end;
+      continue;
+    }
+    if (c === '[' || (c === '!' && src[i + 1] === '[')) {
+      const isImage = c === '!';
+      const link = tryLink(src, isImage ? i + 1 : i, defs, isImage);
+      if (link) {
+        const start = isImage ? i : i;
+        const end = link.end;
+        out[start] = '[';
+        for (let k = start + 1; k < end - 1; k++) out[k] = 'a';
+        if (end - 1 > start) out[end - 1] = ']';
+        i = end;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (c === '<') {
+      const tl = htmlTagLen(src, i);
+      if (tl > 0) {
+        for (let k = i; k < i + tl; k++) out[k] = 'a';
+        i += tl;
+        continue;
+      }
+      // Any other <...> span (e.g. an autolink) is masked too, like marked's
+      // blockSkip html pattern, so delimiters inside it stay invisible.
+      if (src[i + 1] !== ' ') {
+        let j = i + 1;
+        while (j < n && src[j] !== '>' && src[j] !== '<') j++;
+        if (src[j] === '>') {
+          for (let k = i; k <= j; k++) out[k] = 'a';
+          i = j + 1;
+          continue;
+        }
+      }
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  return out.join('');
+}
+
+// Marked's emStrong at position pos (a * or _ run). Returns
+// {end, type, text} or null. masked is the masked src (same length).
+function tryEmStrong(src, masked, pos) {
+  const m = EM_STRONG_L.exec(src.slice(pos));
+  if (!m || (!m[1] && !m[2] && !m[3] && !m[4])) return null;
+  const delimChar = m[0][0];
+  const prevChar = pos > 0 ? src[pos - 1] : '';
+  const midRun = prevChar === delimChar;
+  let runStart = pos;
+  while (runStart > 0 && masked[runStart - 1] === delimChar) runStart--;
+  const runPrevChar = runStart > 0 ? ([...masked.slice(Math.max(0, runStart - 2), runStart)].at(-1) ?? '') : '';
+  const runPrevPunct = runPrevChar === '*' || runPrevChar === '_' || PUNCT_TEST.test(runPrevChar);
+  let pc = prevChar;
+  if (runStart < pos) pc = runPrevChar;
+  const prevPunct = runStart < pos ? runPrevPunct : PUNCT_TEST.test(prevChar);
+  if (m[4] && ALNUM_TEST.test(pc)) return null;
+  const nextChar = m[1] || m[3] || '';
+  if (!nextChar || !pc || prevPunct) {
+    const lLength = [...m[0]].length - 1;
+    let delimTotal = lLength, midDelimTotal = 0;
+    const runLength = pos - runStart + lLength;
+    const openerCanClose = !!runPrevChar.trim() && (!!nextChar || (delimChar === '*' && !runPrevPunct));
+    const endReg = delimChar === '*' ? EM_STRONG_R_AST : EM_STRONG_R_UND;
+    const window = masked.slice(pos + lLength);
+    if (window.indexOf(delimChar) < 0) return null;
+    endReg.lastIndex = 0;
+    let match;
+    while ((match = endReg.exec(window)) !== null) {
+      const rDelim = match[1] || match[2] || match[3] || match[4] || match[5] || match[6];
+      if (!rDelim) continue;
+      let rLength = [...rDelim].length;
+      if (match[3] || match[4]) { delimTotal += rLength; continue; }
+      else if (match[5] || match[6] || openerCanClose) {
+        if (midRun && (match[5] || match[6])) break;
+        if (runLength % 3 && !((runLength + rLength) % 3)) { midDelimTotal += rLength; continue; }
+      }
+      delimTotal -= rLength;
+      if (delimTotal > 0) continue;
+      rLength = Math.min(rLength, rLength + delimTotal + midDelimTotal);
+      const lastCharLength = [...match[0]][0].length;
+      const rawEnd = pos + lLength + match.index + lastCharLength + rLength;
+      const raw = src.slice(pos, rawEnd);
+      if (Math.min(lLength, rLength) % 2) {
+        return { end: rawEnd, type: 'em', text: raw.slice(1, -1) };
+      }
+      return { end: rawEnd, type: 'strong', text: raw.slice(2, -2) };
+    }
+  }
+  return null;
+}
+
+// Marked's del at position pos (a ~ run). Returns {end, text} or null.
+function tryDel(src, masked, pos) {
+  const m = DEL_L.exec(src.slice(pos));
+  if (!m) return null;
+  const nextChar = m[1] || '';
+  const prevChar = pos > 0 ? src[pos - 1] : '';
+  if (!nextChar || !prevChar || PUNCT_TEST.test(prevChar)) {
+    const lLength = [...m[0]].length - 1;
+    let delimTotal = lLength;
+    const window = masked.slice(pos + lLength);
+    if (window.indexOf('~') < 0) return null;
+    DEL_R.lastIndex = 0;
+    let match;
+    while ((match = DEL_R.exec(window)) !== null) {
+      const rDelim = match[1] || match[2] || match[3] || match[4] || match[5] || match[6];
+      if (!rDelim) continue;
+      let rLength = [...rDelim].length;
+      if (rLength !== lLength) continue;
+      if (match[3] || match[4]) { delimTotal += rLength; continue; }
+      delimTotal -= rLength;
+      if (delimTotal > 0) continue;
+      rLength = Math.min(rLength, rLength + delimTotal);
+      const lastCharLength = [...match[0]][0].length;
+      const rawEnd = pos + lLength + match.index + lastCharLength + rLength;
+      const raw = src.slice(pos, rawEnd);
+      return { end: rawEnd, text: raw.slice(lLength, -lLength) };
+    }
+  }
+  return null;
+}
+
 function inlineParse(src, defs, inLink, alt) {
-  const nodes = [];
+  const parts = [];
   let text = '';
-  const flushText = () => { if (text) { nodes.push([0, escText(text)]); text = ''; } };
-  const pushHtml = (h) => { flushText(); if (h) nodes.push([0, h]); };
+  const flushText = () => { if (text) { parts.push(escText(text)); text = ''; } };
+  const pushHtml = (h) => { flushText(); if (h) parts.push(h); };
   const n = src.length;
   let i = 0;
+  // Masked source for emStrong/del closer search (links, code, HTML hidden).
+  const masked = maskInline(src, defs);
 
   // Pre-scan GFM extended autolinks over the whole string: an email's local
   // part can contain delimiter chars (_ * ~) that the scanner would otherwise
@@ -139,8 +341,8 @@ function inlineParse(src, defs, inLink, alt) {
     const auto = autoAt.get(i);
     if (auto) {
       flushText();
-      if (alt) nodes.push([0, escText(auto.text)]);
-      else nodes.push([0, '<a href="' + cleanUrl(auto.href) + '">' + escText(auto.text) + '</a>']);
+      if (alt) parts.push(escText(auto.text));
+      else parts.push('<a href="' + cleanUrl(auto.href) + '">' + escText(auto.text) + '</a>');
       i = auto.end;
       while (ai < autoStarts.length && autoStarts[ai] < i) ai++;
       continue;
@@ -151,7 +353,7 @@ function inlineParse(src, defs, inLink, alt) {
       if (nx === '\n') { // hard break
         text = text.replace(/ +$/, '');
         flushText();
-        nodes.push([0, '<br>']);
+        parts.push('<br>');
         i += 2;
         while (src[i] === ' ' || src[i] === '\t') i++;
       } else if (nx !== undefined && ASCII_PUNCT.has(nx)) {
@@ -183,42 +385,28 @@ function inlineParse(src, defs, inLink, alt) {
       }
       continue;
     }
-    if (c === 42 || c === 95) { // * or _ delimiter run
-      const ch = src[i];
-      let m = 1;
-      while (src[i + m] === ch) m++;
-      const prev = i > 0 ? src[i - 1] : undefined;
-      const next = i + m < n ? src[i + m] : undefined;
-      const leftFlank = !isSpace(next) && (!isPunct(next) || isSpace(prev) || isPunct(prev));
-      const rightFlank = !isSpace(prev) && (!isPunct(prev) || isSpace(next) || isPunct(next));
-      let canOpen, canClose;
-      if (ch === '*') {
-        canOpen = leftFlank;
-        canClose = rightFlank;
+    if (c === 42 || c === 95) { // * or _ emphasis (marked's emStrong)
+      const em = tryEmStrong(src, masked, i);
+      if (em) {
+        const inner = inlineParse(em.text, defs, inLink, alt);
+        pushHtml(alt ? inner : (em.type === 'em' ? '<em>' + inner + '</em>' : '<strong>' + inner + '</strong>'));
+        i = em.end;
       } else {
-        canOpen = leftFlank && (!rightFlank || isPunct(prev));
-        canClose = rightFlank && (!leftFlank || isPunct(next));
+        text += src[i];
+        i += 1;
       }
-      flushText();
-      nodes.push([1, ch, m, canOpen, canClose]);
-      i += m;
       continue;
     }
-    if (c === 126) { // ~ strikethrough (marked: runs of 1-2, closer must match length)
-      let m = 1;
-      while (src[i + m] === '~') m++;
-      const next = i + m < n ? src[i + m] : undefined;
-      if (m <= 2 && next !== undefined && !isSpace(next)) {
-        const close = findDelClose(src, i + m, m);
-        if (close >= 0) {
-          const inner = inlineParse(src.slice(i + m, close), defs, inLink, alt);
-          pushHtml(alt ? inner : '<del>' + inner + '</del>');
-          i = close + m;
-          continue;
-        }
+    if (c === 126) { // ~ strikethrough (marked's del)
+      const d = tryDel(src, masked, i);
+      if (d) {
+        const inner = inlineParse(d.text, defs, inLink, alt);
+        pushHtml(alt ? inner : '<del>' + inner + '</del>');
+        i = d.end;
+      } else {
+        text += '~';
+        i += 1;
       }
-      text += '~'.repeat(m);
-      i += m;
       continue;
     }
     if (c === 91 || c === 33) { // [ or !
@@ -276,7 +464,7 @@ function inlineParse(src, defs, inLink, alt) {
       if (m && m[0].length >= 2) {
         text = text.slice(0, text.length - m[0].length);
         flushText();
-        nodes.push([0, '<br>']);
+        parts.push('<br>');
       } else {
         text += '\n';
       }
@@ -296,8 +484,7 @@ function inlineParse(src, defs, inLink, alt) {
     continue;
   }
   flushText();
-  processEmphasis(nodes);
-  return renderNodes(nodes, alt);
+  return parts.join('');
 }
 
 // ---------------- inline helpers ----------------
@@ -312,20 +499,6 @@ function findCodeClose(src, from, len) {
     while (src[b + m] === '`') m++;
     if (m === len) return b;
     j = b + m;
-  }
-  return -1;
-}
-
-function findDelClose(src, from, len) {
-  let j = from;
-  const n = src.length;
-  while (j < n) {
-    const t = src.indexOf('~', j);
-    if (t < 0) return -1;
-    let m = 1;
-    while (src[t + m] === '~') m++;
-    if (m === len && !isSpace(src[t - 1])) return t;
-    j = t + m;
   }
   return -1;
 }
@@ -711,55 +884,6 @@ function tryEmailAt(src, at, n, skipBoundary) {
   }
   const text = src.slice(s, j);
   return { start: s, end: j, href: 'mailto:' + text, text };
-}
-
-// ---------------- emphasis (CommonMark delimiter stack) ----------------
-
-function processEmphasis(nodes) {
-  let ci = 0;
-  while (ci < nodes.length) {
-    const closer = nodes[ci];
-    if (closer[0] !== 1 || !closer[4]) { ci++; continue; }
-    let oi = -1;
-    for (let k = ci - 1; k >= 0; k--) {
-      const o = nodes[k];
-      if (o[0] === 1 && o[1] === closer[1] && o[3]) {
-        const bothWays = (o[3] && o[4]) || (closer[3] && closer[4]);
-        if (bothWays && (o[2] + closer[2]) % 3 === 0 && !(o[2] % 3 === 0 && closer[2] % 3 === 0)) continue;
-        oi = k;
-        break;
-      }
-    }
-    if (oi < 0) { ci++; continue; }
-    const opener = nodes[oi];
-    const use = opener[2] >= 2 && closer[2] >= 2 ? 2 : 1;
-    const children = nodes.slice(oi + 1, ci);
-    const wrap = [2, use, children];
-    opener[2] -= use;
-    closer[2] -= use;
-    const rep = [];
-    if (opener[2] > 0) rep.push(opener);
-    rep.push(wrap);
-    if (closer[2] > 0) rep.push(closer);
-    nodes.splice(oi, ci - oi + 1, ...rep);
-    if (closer[2] > 0) ci = oi + rep.length - 1;
-    else ci = oi + rep.length;
-  }
-}
-
-function renderNodes(nodes, alt) {
-  let out = '';
-  for (const nd of nodes) {
-    if (nd[0] === 0) out += nd[1];
-    else if (nd[0] === 1) out += nd[1].repeat(nd[2]);
-    else {
-      const inner = renderNodes(nd[2], alt);
-      if (alt) out += inner;
-      else if (nd[1] === 1) out += '<em>' + inner + '</em>';
-      else out += '<strong>' + inner + '</strong>';
-    }
-  }
-  return out;
 }
 
 // ---------------- block parsing ----------------
