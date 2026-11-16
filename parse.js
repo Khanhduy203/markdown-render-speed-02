@@ -152,18 +152,40 @@ const ALNUM_TEST = /[\p{L}\p{N}]/u;
 function maskInline(src, defs) {
   if (src.indexOf('*') < 0 && src.indexOf('_') < 0 && src.indexOf('~') < 0) return src;
   const n = src.length;
-  const out = src.split('');
+  // Phase A (marked's anyPunctuationOutsideCode): escapes become '+', and
+  // the inner backticks of a code span become '+' so the span is clean for
+  // the link pattern in phase B. Length-preserving.
+  const plus = src.split('');
+  {
+    let i = 0;
+    while (i < n) {
+      const c = src[i];
+      if (c === '\\' && i + 1 < n && ASCII_PUNCT.has(src[i + 1])) {
+        plus[i] = '+'; plus[i + 1] = '+'; i += 2; continue;
+      }
+      if (c === '`') {
+        let m = 1;
+        while (src[i + m] === '`') m++;
+        const close = findCodeClose(src, i + m, m);
+        if (close < 0 || close === i + m) { i += m; continue; }
+        for (let k = i + m; k < close; k++) if (plus[k] === '`') plus[k] = '+';
+        i = close + m;
+        continue;
+      }
+      i += 1;
+    }
+  }
+  const ptxt = plus.join('');
+  // Phase B (marked's blockSkip): mask links, code spans, html spans.
+  const out = plus.slice();
   let i = 0;
   while (i < n) {
-    const c = src[i];
-    if (c === '\\' && i + 1 < n && ASCII_PUNCT.has(src[i + 1])) {
-      out[i] = '+'; out[i + 1] = '+'; i += 2; continue;
-    }
+    const c = ptxt[i];
     if (c === '`') {
       let m = 1;
-      while (src[i + m] === '`') m++;
-      const close = findCodeClose(src, i + m, m);
-      if (close < 0) { i += m; continue; }
+      while (ptxt[i + m] === '`') m++;
+      const close = findCodeClose(ptxt, i + m, m);
+      if (close < 0 || close === i + m) { i += m; continue; }
       const end = close + m;
       out[i] = '[';
       for (let k = i + 1; k < end - 1; k++) out[k] = 'a';
@@ -171,11 +193,11 @@ function maskInline(src, defs) {
       i = end;
       continue;
     }
-    if (c === '[' || (c === '!' && src[i + 1] === '[')) {
+    if (c === '[' || (c === '!' && ptxt[i + 1] === '[')) {
       const isImage = c === '!';
-      const link = tryLink(src, isImage ? i + 1 : i, defs, isImage);
+      const link = tryLink(ptxt, isImage ? i + 1 : i, defs, isImage);
       if (link) {
-        const start = isImage ? i : i;
+        const start = i;
         const end = link.end;
         out[start] = '[';
         for (let k = start + 1; k < end - 1; k++) out[k] = 'a';
@@ -187,19 +209,23 @@ function maskInline(src, defs) {
       continue;
     }
     if (c === '<') {
-      const tl = htmlTagLen(src, i);
+      const tl = htmlTagLen(ptxt, i);
       if (tl > 0) {
-        for (let k = i; k < i + tl; k++) out[k] = 'a';
+        out[i] = '[';
+        for (let k = i + 1; k < i + tl - 1; k++) out[k] = 'a';
+        out[i + tl - 1] = ']';
         i += tl;
         continue;
       }
       // Any other <...> span (e.g. an autolink) is masked too, like marked's
       // blockSkip html pattern, so delimiters inside it stay invisible.
-      if (src[i + 1] !== ' ') {
+      if (ptxt[i + 1] !== ' ') {
         let j = i + 1;
-        while (j < n && src[j] !== '>' && src[j] !== '<') j++;
-        if (src[j] === '>') {
-          for (let k = i; k <= j; k++) out[k] = 'a';
+        while (j < n && ptxt[j] !== '>' && ptxt[j] !== '<') j++;
+        if (ptxt[j] === '>') {
+          out[i] = '[';
+          for (let k = i + 1; k < j; k++) out[k] = 'a';
+          out[j] = ']';
           i = j + 1;
           continue;
         }
@@ -589,11 +615,19 @@ function tryLink(src, open, defs, isImage) {
     if (c === '\\') { j += 2; continue; }
     if (c === '`') {
       // Skip a code span: a ] inside it does not close the link text.
+      // Marked's label regex does not require the closing run to match the
+      // opening run's length — any following backtick run closes the skip.
       let m = 1;
       while (src[j + m] === '`') m++;
-      const close = findCodeClose(src, j + m, m);
-      if (close < 0) { j += m; continue; }
-      j = close + m;
+      const nk = src.indexOf('`', j + m);
+      if (nk < 0) {
+        // No closer: only a 2+ run immediately before ] can be skipped.
+        if (m >= 2 && src[j + m] === ']') { j += m; continue; }
+        return null;
+      }
+      let m2 = 1;
+      while (src[nk + m2] === '`') m2++;
+      j = nk + m2;
       continue;
     }
     if (c === '<') {
@@ -607,8 +641,41 @@ function tryLink(src, open, defs, isImage) {
     }
     if (c === '[') {
       // A nested link inside link text blocks the outer link (the inner one
-      // wins). Images may contain links, and links may contain images.
-      if (!isImage && !(src[j - 1] === '!' && !isEscapedAt(src, j - 1))) {
+      // wins). Images may contain links, and links may contain images — so an
+      // image and its following ref label or (dest) are skipped whole.
+      if (src[j - 1] === '!' && !isEscapedAt(src, j - 1)) {
+        // Skip the image's text brackets, then its ref/dest if present.
+        let d2 = 1;
+        let k2 = j + 1;
+        while (k2 < n && d2 > 0) {
+          if (src[k2] === '\\') { k2 += 2; continue; }
+          if (src[k2] === '[') d2++;
+          else if (src[k2] === ']') d2--;
+          k2++;
+        }
+        if (src[k2] === '[') {
+          let d3 = 1;
+          k2++;
+          while (k2 < n && d3 > 0) {
+            if (src[k2] === '\\') { k2 += 2; continue; }
+            if (src[k2] === '[') d3++;
+            else if (src[k2] === ']') d3--;
+            k2++;
+          }
+        } else if (src[k2] === '(') {
+          let d3 = 1;
+          k2++;
+          while (k2 < n && d3 > 0) {
+            if (src[k2] === '\\') { k2 += 2; continue; }
+            if (src[k2] === '(') d3++;
+            else if (src[k2] === ')') d3--;
+            k2++;
+          }
+        }
+        j = k2;
+        continue;
+      }
+      if (!isImage) {
         if (tryLink(src, j, defs, false)) return null;
       }
       depth++; j++; continue;
@@ -1686,9 +1753,12 @@ function parseDelimiter(line) {
 }
 
 function rowEndsTable(line) {
-  const [col, idx] = indentInfo(line);
-  if (col >= 4) return true;
+  // Indented code: 4 literal spaces + non-blank content (a tab-only line is
+  // a row, not code — marked's table row check uses the code regex, which
+  // starts with four spaces).
+  if (/^ {4}\S/.test(line)) return true;
   if (isATXStart(line) || isFenceStart(line) || isHRLine(line)) return true;
+  const [col, idx] = indentInfo(line);
   if (line[idx] === '>') return true;
   if (listMarker(line)) return true;
   const ht = htmlBlockType(line);
@@ -1719,6 +1789,15 @@ Blocks.prototype.consumeDefs = function(lines) {
   return lines.slice(nl + 1);
 };
 
+Blocks.prototype.hasTableDelim = function(lines) {
+  for (let k = 1; k < lines.length; k++) {
+    const delim = parseDelimiter(lines[k]);
+    if (!delim || !delim.hasPipeOrColon) continue;
+    if (splitRowCells(lines[k - 1]).length === delim.length) return true;
+  }
+  return false;
+};
+
 Blocks.prototype.tryTable = function(lines) {
   for (let k = 1; k < lines.length; k++) {
     const delim = parseDelimiter(lines[k]);
@@ -1729,7 +1808,8 @@ Blocks.prototype.tryTable = function(lines) {
     let r = k + 1;
     while (r < lines.length) {
       const l = lines[r];
-      if (isBlank(l) || rowEndsTable(l)) break;
+      // Marked's table blank check is space-only: a tab-only line is a row.
+      if (/^ *$/.test(l) || rowEndsTable(l)) break;
       rows.push(splitRowCells(l));
       r++;
     }
@@ -1772,6 +1852,9 @@ Blocks.prototype.tryParagraph = function() {
     if (isBlank(l)) {
       // A trailing whitespace-only line at end of input is paragraph text.
       if (j === L.length - 1 && l.length > 0) { paraLines.push(l); j++; }
+      // A tab-only line is a table row in marked (its table blank check is
+      // space-only), so keep gathering when a table is in progress.
+      else if (l.includes('\t') && this.hasTableDelim(paraLines)) { paraLines.push(l); j++; continue; }
       break;
     }
     if (j > start) {
