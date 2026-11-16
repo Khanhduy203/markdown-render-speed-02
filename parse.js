@@ -320,7 +320,15 @@ function tryDel(src, masked, pos) {
   return null;
 }
 
+// Document-level inLink state (marked's lexer.state.inLink): set by an
+// inline <a ...> start tag, cleared by </a>, and NOT reset between
+// paragraphs — a <a> tag suppresses all later GFM autolinks in the doc.
+let docInLink = false;
+
 function inlineParse(src, defs, inLink, alt) {
+  // Link text is a scoped run (marked's outputLink saves/restores inLink):
+  // tags inside it must not leak the document-level state.
+  const savedInLink = inLink ? docInLink : false;
   const parts = [];
   let text = '';
   const flushText = () => { if (text) { parts.push(escText(text)); text = ''; } };
@@ -364,7 +372,7 @@ function inlineParse(src, defs, inLink, alt) {
   }
 
   while (i < n) {
-    const auto = autoAt.get(i);
+    const auto = !docInLink ? autoAt.get(i) : undefined;
     if (auto) {
       flushText();
       if (alt) parts.push(escText(auto.text));
@@ -477,6 +485,12 @@ function inlineParse(src, defs, inLink, alt) {
       const tagLen = htmlTagLen(src, i);
       if (tagLen > 0) {
         const raw = src.slice(i, i + tagLen);
+        // marked's tag tokenizer: <a + space opens inLink, </a> closes it.
+        if (raw.charCodeAt(1) === 97 || raw.charCodeAt(1) === 65) {
+          if (raw.charCodeAt(2) === 32) docInLink = true;
+        } else if (raw.charCodeAt(1) === 47 && (raw.charCodeAt(2) === 97 || raw.charCodeAt(2) === 65) && raw.charCodeAt(3) === 62) {
+          docInLink = false;
+        }
         pushHtml(alt ? esc(raw) : raw);
         i += tagLen;
         continue;
@@ -504,12 +518,13 @@ function inlineParse(src, defs, inLink, alt) {
     // Plain text run up to the next special char or the next autolink start.
     let j = nextSpecial(i);
     while (ai < autoStarts.length && autoStarts[ai] < i) ai++;
-    if (ai < autoStarts.length && autoStarts[ai] < j) j = autoStarts[ai];
+    if (!docInLink && ai < autoStarts.length && autoStarts[ai] < j) j = autoStarts[ai];
     text += src.slice(i, j);
     i = j;
     continue;
   }
   flushText();
+  if (inLink) docInLink = savedInLink;
   return parts.join('');
 }
 
@@ -616,12 +631,16 @@ function tryLink(src, open, defs, isImage) {
     if (c === '`') {
       // Skip a code span: a ] inside it does not close the link text.
       // Marked's label regex does not require the closing run to match the
-      // opening run's length — any following backtick run closes the skip.
+      // opening run's length — any following backtick run closes the skip,
+      // but only one that comes BEFORE the next ] (a backtick on a later
+      // line is not this label's closer).
       let m = 1;
       while (src[j + m] === '`') m++;
       const nk = src.indexOf('`', j + m);
-      if (nk < 0) {
-        // No closer: only a 2+ run immediately before ] can be skipped.
+      const br = src.indexOf(']', j + m);
+      if (nk < 0 || (br >= 0 && br < nk)) {
+        // No closer before the next ]: only a 2+ run immediately before ]
+        // can be skipped.
         if (m >= 2 && src[j + m] === ']') { j += m; continue; }
         return null;
       }
@@ -1318,10 +1337,14 @@ class Blocks {
       // A list marker line ends the quote — it is never a lazy continuation.
       if (listMarker(l)) break;
       if (interruptsPara(l, true)) break;
-      // A lazy line loses its leading whitespace; a lazy setext underline is
-      // kept as literal text, indented by marked. The LAZY sentinel keeps the
-      // inner parse from re-reading the stripped line as a block start.
-      const lstripped = l.replace(/^[ \t]+/, '');
+      // A lazy line is added raw; a line at indent >= 4 is indented code
+      // (stripped 4 cols when appended to the text token), smaller indents
+      // keep their leading whitespace. A lazy setext underline is kept as
+      // literal text, indented by marked. The LAZY sentinel keeps the inner
+      // parse from re-reading the line as a block start.
+      const [lc] = indentInfo(l);
+      const lkept = lc >= 4 ? stripCols(l, 4) : l;
+      const lstripped = lkept;
       inner.push(LAZY + (isSetextLine(lstripped) ? '    ' + lstripped : lstripped));
       j++;
     }
@@ -1447,9 +1470,14 @@ class Blocks {
       // A list marker line ends this item (it starts a new item, handled by
       // the outer loop) — it is never a lazy continuation.
       if (listMarker(l)) break;
-      // lazy continuation?
+      // lazy continuation? Marked adds the raw line to the item content;
+      // blockTokens then treats a line at indent >= 4 as indented code
+      // (stripped 4 cols when appended to the text token) and keeps the
+      // leading whitespace of lines at indent < 4.
       if (ps.inPara && !interruptsPara(l, true)) {
-        const lstripped = l.replace(/^[ \t]+/, '');
+        const [lc] = indentInfo(l);
+        const lkept = lc >= 4 ? stripCols(l, 4) : l;
+        const lstripped = lkept;
         content.push(LAZY + (isSetextLine(lstripped) ? '    ' + lstripped : lstripped));
         j++;
         continue;
@@ -2024,6 +2052,7 @@ function parse(src) {
   const srcEndsWithNL = src.endsWith('\n');
   if (srcEndsWithNL) lines.pop();
   const defs = new Map();
+  docInLink = false;
   const blocks = new Blocks(lines, defs, srcEndsWithNL).parse();
   return renderBlocks(blocks, defs);
 }
