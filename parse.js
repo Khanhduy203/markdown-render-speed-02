@@ -195,7 +195,7 @@ function maskInline(src, defs) {
     }
     if (c === '[' || (c === '!' && ptxt[i + 1] === '[')) {
       const isImage = c === '!';
-      const link = tryLink(ptxt, isImage ? i + 1 : i, defs, isImage);
+      const link = tryLink(ptxt, isImage ? i + 1 : i, defs, isImage, true);
       if (link) {
         const start = i;
         const end = link.end;
@@ -620,7 +620,7 @@ function isEscapedAt(src, pos) {
   return count % 2 === 1;
 }
 
-function tryLink(src, open, defs, isImage) {
+function tryLink(src, open, defs, isImage, strictCode) {
   const n = src.length;
   let depth = 0;
   let j = open + 1;
@@ -633,9 +633,16 @@ function tryLink(src, open, defs, isImage) {
       // Marked's label regex does not require the closing run to match the
       // opening run's length — any following backtick run closes the skip,
       // but only one that comes BEFORE the next ] (a backtick on a later
-      // line is not this label's closer).
+      // line is not this label's closer). For MASKING, blockSkip's link
+      // pattern uses a backreference, so the runs must match exactly.
       let m = 1;
       while (src[j + m] === '`') m++;
+      if (strictCode) {
+        const close = findCodeClose(src, j + m, m);
+        if (close < 0) return null;
+        j = close + m;
+        continue;
+      }
       const nk = src.indexOf('`', j + m);
       const br = src.indexOf(']', j + m);
       if (nk < 0 || (br >= 0 && br < nk)) {
@@ -695,7 +702,7 @@ function tryLink(src, open, defs, isImage) {
         continue;
       }
       if (!isImage) {
-        if (tryLink(src, j, defs, false)) return null;
+        if (tryLink(src, j, defs, false, strictCode)) return null;
       }
       depth++; j++; continue;
     }
