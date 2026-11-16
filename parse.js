@@ -145,6 +145,11 @@ const DEL_R = buildDelimRe(
 
 const PUNCT_TEST = /^((?![*_])[\s\p{P}\p{S}])/u;
 const ALNUM_TEST = /[\p{L}\p{N}]/u;
+// Sticky (no ^ anchor) versions of the L regexes for tryEmStrong/tryDel:
+// exec at lastIndex instead of slicing the source (avoids a substring
+// allocation per opener).
+const EM_STRONG_L_Y = buildDelimRe('(?:\\*+(?:((?!\\*)punct)|([^\\s*]))?)|_+(?:((?!_)punct)|([^\\s_]))?', 'yu', _NPG, _PSG, _PG);
+const DEL_L_Y = buildDelimRe('~~?(?:((?!~)punct)|[^\\s~])', 'yu', _NP, _PS, _P);
 
 // Mask links, code spans, HTML tags and escapes with same-length filler so
 // emStrong/del do not see delimiters inside them. Length-preserving: masked
@@ -266,7 +271,8 @@ function maskInline(src, defs) {
 // Marked's emStrong at position pos (a * or _ run). Returns
 // {end, type, text} or null. masked is the masked src (same length).
 function tryEmStrong(src, masked, pos) {
-  const m = EM_STRONG_L.exec(src.slice(pos));
+  EM_STRONG_L_Y.lastIndex = pos;
+  const m = EM_STRONG_L_Y.exec(src);
   if (!m || (!m[1] && !m[2] && !m[3] && !m[4])) return null;
   const delimChar = m[0][0];
   const prevChar = pos > 0 ? src[pos - 1] : '';
@@ -316,7 +322,8 @@ function tryEmStrong(src, masked, pos) {
 
 // Marked's del at position pos (a ~ run). Returns {end, text} or null.
 function tryDel(src, masked, pos) {
-  const m = DEL_L.exec(src.slice(pos));
+  DEL_L_Y.lastIndex = pos;
+  const m = DEL_L_Y.exec(src);
   if (!m) return null;
   const nextChar = m[1] || '';
   const prevChar = pos > 0 ? src[pos - 1] : '';
@@ -367,11 +374,13 @@ function inlineParse(src, defs, inLink, alt) {
   // part can contain delimiter chars (_ * ~) that the scanner would otherwise
   // split before the autolink is seen. Autolinks inside code spans or link
   // text are harmless — the main loop jumps over those constructs first.
+  // Fast path: no ':', '@' or 'www.' means no autolink is possible.
   const autoAt = new Map();
   let p = 0;
   // No autolinks inside link text (inLink) or alt text: they render as plain
   // text there, and a nested <a> would be wrong.
-  while (!alt && !inLink && p < n) {
+  const hasAutoCand = !alt && !inLink && (src.indexOf(':') >= 0 || src.indexOf('@') >= 0 || src.indexOf('www.') >= 0);
+  while (hasAutoCand && p < n) {
     const cand = nextAutolinkCand(src, p, n);
     if (cand < 0) break;
     const res = tryExtAutolink(src, cand, n);
