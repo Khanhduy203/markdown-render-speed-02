@@ -1907,7 +1907,9 @@ Blocks.prototype.tryParagraph = function() {
     }
     if (j > start) {
       const se = isSetextLine(l);
-      if (se) {
+      // A setext-looking line is a table row, not a heading underline, when
+      // the paragraph so far is a table (marked's table body swallows it).
+      if (se && !this.hasTableDelim(paraLines)) {
         const text = this.normPara(this.stripLazy(this.consumeDefs(paraLines)));
         if (text.length) {
           this.out.push({ t: 'h', level: se, text: text.join('\n') });
